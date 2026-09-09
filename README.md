@@ -47,4 +47,7 @@ sphinx-build -b html docs/source docs/_build/html
 
 ## License
 
-See [LICENSE](LICENSE).
+JTrack Insight is source-available under the
+[PolyForm Noncommercial License 1.0.0](LICENSE). It may be used for
+non-commercial research and scientific purposes; commercial use requires
+separate permission from the copyright holder.
