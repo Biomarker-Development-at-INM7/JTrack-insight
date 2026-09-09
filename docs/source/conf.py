@@ -28,7 +28,7 @@ autodoc_member_order = "bysource"
 autodoc_typehints = "description"
 autodoc_mock_imports = ["PySide6"]
 templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "api.rst", "api/**"]
 
 source_suffix = {
     ".rst": "restructuredtext",

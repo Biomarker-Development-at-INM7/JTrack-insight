@@ -34,5 +34,4 @@ Start with :doc:`quickstart` for a first analysis, then use the step-by-step
    overview
    architecture
    distribution
-   api
    glossary
