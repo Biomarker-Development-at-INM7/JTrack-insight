@@ -30,7 +30,8 @@ standalone application that can:
 
 ### Local standalone mode
 
-- local browser UI served from Python
+- desktop window around the local Python app
+- local browser-compatible UI served from Python
 - local file loading
 - local project save/resume
 - local report export
@@ -51,4 +52,60 @@ standalone application that can:
 5. Build local web workflow screens.
 6. Add optional backend endpoints.
 
-See [docs/architecture.md](docs/architecture.md) for the module map.
+## Running the App
+
+### Local browser launcher
+
+```bash
+cd "JTrack-insight"
+source .venv/bin/activate
+python3 main.py --mode browser
+```
+
+### Local web mode
+
+```bash
+cd "JTrack-insight"
+source .venv/bin/activate
+python3 main.py --mode web
+```
+
+## Distribution
+
+This project now includes a local app-launch path based on:
+
+- `FastAPI` for the local app backend
+- the system browser for the interface
+- `PyInstaller` for packaging
+
+See:
+
+- [docs/architecture.md](docs/architecture.md)
+- [docs/distribution.md](docs/distribution.md)
+
+## Read the Docs
+
+This repository now includes a Read the Docs-ready Sphinx configuration.
+
+Main files:
+
+- `.readthedocs.yaml`
+- `docs/requirements.txt`
+- `docs/source/conf.py`
+- `docs/source/index.rst`
+
+Main end-user tutorial pages:
+
+- `docs/source/quickstart.md`
+- `docs/source/tutorial.md`
+- `docs/source/workflow.md`
+- `docs/source/visualization.md`
+
+To build the docs locally after installing the documentation dependencies:
+
+```bash
+cd "JTrack-insight"
+source .venv/bin/activate
+pip install -r docs/requirements.txt
+sphinx-build -b html docs/source docs/_build/html
+```

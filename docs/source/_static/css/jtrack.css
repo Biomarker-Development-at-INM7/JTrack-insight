@@ -1,0 +1,34 @@
+/* Lightweight local branding while preserving the Read the Docs layout. */
+:root {
+  --jtrack-teal: #0d9296;
+  --jtrack-navy: #14324d;
+}
+
+.wy-side-nav-search,
+.wy-nav-top {
+  background: var(--jtrack-navy);
+}
+
+.wy-menu-vertical a:active,
+.wy-menu-vertical a:hover,
+.wy-menu-vertical li.current a {
+  color: var(--jtrack-navy);
+}
+
+.rst-content a,
+.rst-content a:visited {
+  color: #087d80;
+}
+
+.rst-content h1,
+.rst-content h2,
+.rst-content h3 {
+  color: var(--jtrack-navy);
+}
+
+img.screenshot {
+  border: 1px solid #d7e0e8;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(20, 50, 77, 0.12);
+  margin: 1rem 0 1.5rem;
+}

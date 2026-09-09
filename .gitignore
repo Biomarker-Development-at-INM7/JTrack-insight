@@ -13,3 +13,6 @@ Archive.zip
 
 build/
 dist/
+docs/_build/
+.pyinstaller-config/
+tmp/

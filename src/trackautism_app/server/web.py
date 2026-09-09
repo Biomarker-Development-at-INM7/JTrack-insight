@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import csv
 import html
 import io
@@ -14,6 +14,8 @@ import re
 from pathlib import Path
 import platform
 import subprocess
+import threading
+import time
 from typing import Iterable
 from urllib.parse import urlencode
 
@@ -53,6 +55,7 @@ class PrototypeState:
     data_root: str | None = None
     indexed_rows: list[IndexedFile] = field(default_factory=list)
     qc_rows: list[QCScanItem] = field(default_factory=list)
+    qc_excluded_files: set[str] = field(default_factory=set)
     filtered_rows: list[IndexedFile] = field(default_factory=list)
     loaded_rows: list[dict] = field(default_factory=list)
     loaded_filtered_rows: list[dict] = field(default_factory=list)
@@ -65,6 +68,7 @@ class PrototypeState:
     location_daily: list[dict] = field(default_factory=list)
     location_trajectory: list[dict] = field(default_factory=list)
     location_review: dict | None = None
+    lockunlock_daily: list[dict] = field(default_factory=list)
     pedometer_daily: list[dict] = field(default_factory=list)
     pedometer_review: dict | None = None
     generic_sensor_daily: list[dict] = field(default_factory=list)
@@ -88,10 +92,18 @@ class PrototypeState:
     group_source_rows: list[dict] = field(default_factory=list)
     group_selected_column: str | None = None
     group_comorbidity_columns: list[str] = field(default_factory=list)
+    operation_name: str | None = None
+    operation_message: str | None = None
+    operation_current: int = 0
+    operation_total: int = 0
+    operation_running: bool = False
+    operation_error: str | None = None
     status: str = "Welcome. Load a dataset to begin."
 
 
 APP_STATE = PrototypeState()
+SERVER_INSTANCE: uvicorn.Server | None = None
+APP_STATE_LOCK = threading.RLock()
 
 FEATURE_TRANSFORM_CHOICES = [
     ("none", "No transformation"),
@@ -100,6 +112,12 @@ FEATURE_TRANSFORM_CHOICES = [
     ("sqrt", "Square root"),
     ("zscore", "Z-score"),
     ("center", "Mean-center"),
+]
+WEAR_STATE_FILTER_CHOICES = [
+    ("All", "All wear states"),
+    ("on_wrist", "On-wrist only"),
+    ("off_wrist", "Off-wrist only"),
+    ("unknown", "No confirmed wrist state"),
 ]
 WORKFLOW_STEPS = [
     ("home", "Home"),
@@ -116,8 +134,9 @@ WORKFLOW_STEPS = [
 
 def _workflow_status_summary() -> str:
     """Compact global status: useful context without adding repeated tables."""
-    indexed_subjects = len({getattr(row, "username", "") for row in APP_STATE.indexed_rows if getattr(row, "username", "")})
-    indexed_sensors = len({getattr(row, "sensorname", "") for row in APP_STATE.indexed_rows if getattr(row, "sensorname", "")})
+    active_index = _active_indexed_rows()
+    indexed_subjects = len({getattr(row, "username", "") for row in active_index if getattr(row, "username", "")})
+    indexed_sensors = len({getattr(row, "sensorname", "") for row in active_index if getattr(row, "sensorname", "")})
     generated_rows = len(_generated_feature_rows(APP_STATE.generated_feature_key)) if APP_STATE.generated_feature_key else 0
     qc_rows = len(APP_STATE.feature_qc_rows or [])
     labels = len(APP_STATE.group_label_rows or [])
@@ -132,6 +151,124 @@ def _workflow_status_summary() -> str:
         f"<div class='workflow-mini'><div class='k'>{html.escape(str(label))}</div><div class='v'>{html.escape(str(value))}</div></div>"
         for label, value in items
     ) + "</div>"
+
+
+def _operation_progress(current: int, total: int, message: str) -> None:
+    """Store progress from a worker without blocking the web request."""
+    with APP_STATE_LOCK:
+        APP_STATE.operation_current = max(0, int(current))
+        APP_STATE.operation_total = max(0, int(total))
+        APP_STATE.operation_message = str(message)
+
+
+def _start_background_operation(name: str, worker) -> bool:
+    """Run one expensive operation at a time and expose its live status to the UI."""
+    with APP_STATE_LOCK:
+        if APP_STATE.operation_running:
+            APP_STATE.status = f"{APP_STATE.operation_name or 'Another operation'} is still running. Wait for it to finish before starting another task."
+            return False
+        APP_STATE.operation_name = name
+        APP_STATE.operation_message = "Preparing task..."
+        APP_STATE.operation_current = 0
+        APP_STATE.operation_total = 0
+        APP_STATE.operation_error = None
+        APP_STATE.operation_running = True
+        APP_STATE.status = f"{name} started. Keep this page open; progress updates automatically."
+
+    def _runner() -> None:
+        try:
+            worker(_operation_progress)
+        except Exception as exc:  # pragma: no cover - depends on user files and filesystem
+            with APP_STATE_LOCK:
+                APP_STATE.operation_error = str(exc)
+                APP_STATE.status = f"{name} failed: {exc}"
+        finally:
+            with APP_STATE_LOCK:
+                APP_STATE.operation_running = False
+
+    threading.Thread(target=_runner, daemon=True, name=f"jtrack-{name.lower().replace(' ', '-')}").start()
+    return True
+
+
+def _operation_banner() -> str:
+    with APP_STATE_LOCK:
+        name = APP_STATE.operation_name
+        message = APP_STATE.operation_message
+        current = APP_STATE.operation_current
+        total = APP_STATE.operation_total
+        running = APP_STATE.operation_running
+        error = APP_STATE.operation_error
+    if not name or (not running and not error):
+        return ""
+
+    if total > 0:
+        percent = min(100, round((current / total) * 100))
+        progress = f"<progress value='{current}' max='{total}'></progress><span>{current:,} / {total:,} files ({percent}%)</span>"
+    else:
+        progress = "<div class='operation-indeterminate'><span></span></div><span>Discovering files; the total will appear shortly.</span>"
+    state_label = "Working" if running else "Needs attention"
+    refresh = "<script>window.setTimeout(function () { window.location.reload(); }, 1000);</script>" if running else ""
+    return f"""
+    <section class='operation-panel' role='status' aria-live='polite'>
+      <div class='operation-heading'><strong>{html.escape(state_label)}: {html.escape(name)}</strong><span>{html.escape(message or '')}</span></div>
+      <div class='operation-progress'>{progress}</div>
+      {f"<div class='operation-error'>{html.escape(error)}</div>" if error else ''}
+      <div class='compact-note'>You can keep the app open while this runs. Do not start another load, QC, or scope-load task until it finishes.</div>
+    </section>
+    {refresh}
+    """
+
+
+def _qc_file_key(path: object) -> str:
+    return str(path or "")
+
+
+def _active_indexed_rows() -> list[IndexedFile]:
+    if not APP_STATE.qc_excluded_files:
+        return APP_STATE.indexed_rows
+    excluded = APP_STATE.qc_excluded_files
+    return [row for row in APP_STATE.indexed_rows if _qc_file_key(getattr(row, "source_file", "")) not in excluded]
+
+
+def _reset_downstream_state() -> None:
+    APP_STATE.filtered_rows = _active_indexed_rows()
+    APP_STATE.loaded_rows = []
+    APP_STATE.loaded_filtered_rows = []
+    APP_STATE.selected_sensor_name = None
+    APP_STATE.selected_wearable_sensor = None
+    APP_STATE.app_usage_daily = []
+    APP_STATE.app_usage_category_daily = []
+    APP_STATE.app_usage_category_daily_wide = []
+    APP_STATE.app_usage_review = None
+    APP_STATE.location_daily = []
+    APP_STATE.location_trajectory = []
+    APP_STATE.location_review = None
+    APP_STATE.lockunlock_daily = []
+    APP_STATE.pedometer_daily = []
+    APP_STATE.pedometer_review = None
+    APP_STATE.generic_sensor_daily = []
+    APP_STATE.activity_features = []
+    APP_STATE.custom_feature_rows = []
+    APP_STATE.custom_feature_last_error = None
+    APP_STATE.generated_feature_key = None
+    APP_STATE.generated_feature_name = None
+    APP_STATE.generated_temporal_frequency = "daily"
+    APP_STATE.feature_qc_rows = []
+    APP_STATE.feature_qc_audit_rows = []
+    APP_STATE.feature_qc_description = None
+
+
+def _duplicate_exclusion_file_keys(qc_rows: list[QCScanItem]) -> set[str]:
+    by_group: dict[str, list[QCScanItem]] = {}
+    for item in qc_rows:
+        if getattr(item, "duplicate_file", False) and getattr(item, "duplicate_group", None):
+            by_group.setdefault(str(item.duplicate_group), []).append(item)
+    excluded: set[str] = set()
+    for items in by_group.values():
+        ordered = sorted(items, key=lambda item: _qc_file_key(getattr(item, "source_file", "")))
+        for item in ordered[1:]:
+            excluded.add(_qc_file_key(getattr(item, "source_file", "")))
+    return excluded
 
 def _page_shell(current_step: str, title: str, body: str) -> HTMLResponse:
     def _tab_item(key: str, label: str, idx: int) -> str:
@@ -278,6 +415,31 @@ def _page_shell(current_step: str, title: str, body: str) -> HTMLResponse:
             overflow: hidden;
             text-overflow: ellipsis;
             padding-bottom: 10px;
+          }}
+          .topbar-actions {{
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            justify-self: end;
+            min-width: 0;
+            padding-bottom: 10px;
+          }}
+          .topbar-action-form {{
+            margin: 0;
+            flex: 0 0 auto;
+          }}
+          .topbar-button {{
+            background: rgba(255, 255, 255, 0.14);
+            color: white;
+            border: 1px solid rgba(255, 255, 255, 0.26);
+            border-radius: 999px;
+            padding: 8px 14px;
+            font-size: 13px;
+            font-weight: 650;
+            cursor: pointer;
+          }}
+          .topbar-button:hover {{
+            background: rgba(255, 255, 255, 0.22);
           }}
           .root-path {{
             color: #c6d5e3;
@@ -561,6 +723,59 @@ def _page_shell(current_step: str, title: str, body: str) -> HTMLResponse:
             margin-top: 14px;
             color: #28445d;
           }}
+          .operation-panel {{
+            background: #edf9f5;
+            border: 1px solid #a9dcc9;
+            border-left: 5px solid #11875d;
+            border-radius: 12px;
+            padding: 14px 16px;
+            margin: 0 0 16px 0;
+            color: #173e32;
+          }}
+          .operation-heading {{
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-bottom: 10px;
+          }}
+          .operation-heading strong {{ color: #0c6747; }}
+          .operation-progress {{
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 13px;
+            color: #345d50;
+          }}
+          .operation-progress progress {{
+            width: min(460px, 70vw);
+            height: 14px;
+            accent-color: #11875d;
+          }}
+          .operation-indeterminate {{
+            width: min(460px, 70vw);
+            height: 12px;
+            overflow: hidden;
+            border-radius: 999px;
+            background: #d2ebe0;
+          }}
+          .operation-indeterminate span {{
+            display: block;
+            width: 36%;
+            height: 100%;
+            border-radius: inherit;
+            background: #11875d;
+            animation: operation-load 1.1s ease-in-out infinite;
+          }}
+          .operation-error {{
+            margin-top: 10px;
+            color: #9d2b2b;
+            font-weight: 650;
+          }}
+          @keyframes operation-load {{
+            from {{ transform: translateX(-110%); }}
+            to {{ transform: translateX(310%); }}
+          }}
           .grid {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -828,7 +1043,12 @@ def _page_shell(current_step: str, title: str, body: str) -> HTMLResponse:
                 <div class="brand">JTrack Insight</div>
                 <div class="sub">Digital phenotyping QC and analysis</div>
               </div>
-              <div class="topbar-meta">{root_text}</div>
+              <div class="topbar-actions">
+                <div class="topbar-meta">{root_text}</div>
+                <form class="topbar-action-form" action="/action/shutdown_server" method="get" onsubmit="return confirm('Stop the local JTrack Insight server?');">
+                  <button type="submit" class="topbar-button">Stop Server</button>
+                </form>
+              </div>
             </div>
             <div class="workflow-tabs-wrap">
               <nav class="workflow-tabs" aria-label="Workflow tabs">{nav}</nav>
@@ -838,6 +1058,7 @@ def _page_shell(current_step: str, title: str, body: str) -> HTMLResponse:
             <section class="hero">
               <h1>{html.escape(title)}</h1>
             </section>
+            {_operation_banner()}
             {body}
             <div class="status">{html.escape(APP_STATE.status)}</div>
           </main>
@@ -933,7 +1154,8 @@ def _compact_kv(items: list[tuple[str, object]]) -> str:
 
 
 def _step1_page(dataset_root: str | None = None) -> HTMLResponse:
-    counts = summarize_indexed_files(APP_STATE.indexed_rows) if APP_STATE.indexed_rows else {"json_files": 0, "subjects": 0, "devices": 0, "sensors": 0}
+    active_rows = _active_indexed_rows()
+    counts = summarize_indexed_files(active_rows) if active_rows else {"json_files": 0, "subjects": 0, "devices": 0, "sensors": 0}
     summary_cards = _summary_metrics({
         "JSON files": counts["json_files"],
         "Subjects": counts["subjects"],
@@ -945,7 +1167,7 @@ def _step1_page(dataset_root: str | None = None) -> HTMLResponse:
     <div class="step-grid">
       <div class="card side-card">
         <h2>Load dataset</h2>
-        <p class="compact-note">Choose the study root folder or paste an absolute path. Indexing also runs the file-level QC scan.</p>
+        <p class="compact-note">Choose the study root folder or paste an absolute path. This step quickly indexes participants, devices, and sensor streams; content-based file QC runs in Step 2.</p>
         <form action="/action/pick_dataset" method="get">
           <button type="submit">Choose Folder</button>
         </form>
@@ -957,7 +1179,7 @@ def _step1_page(dataset_root: str | None = None) -> HTMLResponse:
       </div>
       <div class="card preview-card">
         <h2>Indexed dataset</h2>
-        {summary_cards if APP_STATE.indexed_rows else '<div class="empty-state">No dataset indexed yet.</div>'}
+        {summary_cards if active_rows else '<div class="empty-state">No dataset indexed yet.</div>'}
         <details class="clean-details">
           <summary>Indexing note</summary>
           <p class="compact-note">The index summarizes available JSON files, participants, devices, and sensor streams without loading all raw records into memory.</p>
@@ -972,23 +1194,58 @@ def _step2_page() -> HTMLResponse:
     qc_rows = APP_STATE.qc_rows
     if qc_rows:
         summary = summarize_qc_results(qc_rows)
+        duplicate_exclusions = _duplicate_exclusion_file_keys(qc_rows)
+        invalid_json_exclusions = {
+            _qc_file_key(getattr(item, "source_file", ""))
+            for item in qc_rows
+            if not getattr(item, "json_valid", True)
+        }
         metrics = _summary_metrics({
             "Total files": summary.total_files,
             "Clean files": summary.clean_files,
             "Invalid JSON": summary.invalid_json_files,
             "Duplicates": summary.duplicate_files,
+            "Excluded": len(APP_STATE.qc_excluded_files),
         })
         flagged = _qc_flagged_preview_rows()
         flagged_preview = _table_preview(flagged, limit=20) if flagged else "<div class='empty-state'>No flagged files detected.</div>"
+        action_note = (
+            f"<p class='compact-note'>Duplicate exclusion will keep one file per duplicate hash group and exclude {len(duplicate_exclusions)} extra copy/copies. "
+            f"Invalid-JSON exclusion will remove {len(invalid_json_exclusions)} file(s). "
+            f"Current QC exclusions: {len(APP_STATE.qc_excluded_files)} file(s).</p>"
+        )
+        action_controls = f"""
+        <div class="button-row" style="margin-top:12px; flex-wrap:wrap;">
+          <form action="/action/exclude_qc_duplicates" method="get">
+            <button type="submit">Exclude Duplicate Copies</button>
+          </form>
+          <form action="/action/exclude_qc_invalid_json" method="get">
+            <button type="submit">Exclude Invalid JSON</button>
+          </form>
+          <form action="/action/clear_qc_exclusions" method="get">
+            <button type="submit" class="secondary">Clear QC Exclusions</button>
+          </form>
+        </div>
+        """
     else:
-        metrics = "<div class='empty-state'>No QC scan has been run yet. Load a dataset in Step 1.</div>"
+        metrics = "<div class='empty-state'>No QC scan has been run yet. Run it before selecting the analysis scope.</div>"
         flagged_preview = "<div class='empty-state'>No flagged-file preview available.</div>"
+        action_note = "<p class='compact-note'>QC reads file contents to detect invalid JSON and duplicate content hashes. It can take longer for large datasets.</p>"
+        action_controls = """
+        <div class="button-row" style="margin-top:12px;">
+          <form action="/action/run_file_qc" method="get">
+            <button type="submit">Run File QC</button>
+          </form>
+        </div>
+        """
     body = f"""
     <div class="step-grid">
       <div class="card side-card">
         <h2>File QC</h2>
         <p class="compact-note">Review JSON validity and duplicate-file checks before computing features.</p>
         {metrics}
+        {action_note}
+        {action_controls}
       </div>
       <div class="card preview-card">
         <h2>Flagged files</h2>
@@ -1005,6 +1262,7 @@ FEATURE_LABELS = {
     "application_usage_daily": "Application usage daily features",
     "application_usage_category_daily": "Application usage category features",
     "location_daily": "Location daily features",
+    "lockunlock_daily": "Lock/unlock daily features",
     "pedometer_daily": "Pedometer daily features",
     "sensor_daily_summary": "Sensor summary features",
     "activity_features": "Android activity features",
@@ -1017,6 +1275,8 @@ SENSOR_FEATURES = {
     "LOCATION": ["location_daily"],
     "GPS": ["location_daily"],
     "GEOLOCATION": ["location_daily"],
+    "LOCKUNLOCK": ["lockunlock_daily"],
+    "LOCK_UNLOCK": ["lockunlock_daily"],
     "PEDOMETER": ["pedometer_daily"],
     "STEPS": ["pedometer_daily"],
     "STEP": ["pedometer_daily"],
@@ -1082,6 +1342,14 @@ CORE_SENSOR_FEATURE_METRICS = {
         ("daily_distance", "Distance"),
         ("mobility", "Mobility radius / location variability"),
     ],
+    "LOCKUNLOCK": [
+        ("screen_time", "Screen-on time proxy"),
+        ("daily_usage_summary", "Subject-level mean / median daily screen-on proxy"),
+    ],
+    "LOCK_UNLOCK": [
+        ("screen_time", "Screen-on time proxy"),
+        ("daily_usage_summary", "Subject-level mean / median daily screen-on proxy"),
+    ],
     "PEDOMETER": [
         ("daily_steps", "Steps"),
         ("active_hours", "Active hours"),
@@ -1101,50 +1369,63 @@ CORE_SENSOR_FEATURE_METRICS = {
     "BBI": [
         ("bbi_hrv", "SDNN / RMSSD / pNN metrics"),
         ("outliers", "Artifact / out-of-range BBI"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "ENHANCED_BBI": [
         ("bbi_hrv", "SDNN / RMSSD / pNN metrics"),
         ("outliers", "Artifact / out-of-range BBI"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "HEART_RATE": [
         ("resting_hr", "Resting heart-rate proxy"),
         ("peak_hr", "Peak heart-rate proxy"),
         ("hr_variability", "Heart-rate variability / range"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "HEARTRATE": [
         ("resting_hr", "Resting heart-rate proxy"),
         ("peak_hr", "Peak heart-rate proxy"),
         ("hr_variability", "Heart-rate variability / range"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "HRV": [
         ("hrv_distribution", "HRV distribution"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "STRESS": [
         ("stress_burden", "Stress burden"),
         ("high_stress", "High-stress percentage"),
         ("recovery", "Low-stress / recovery percentage"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "SPO2": [
         ("spo2_summary", "SpO2 summary"),
         ("low_spo2", "Low-SpO2 burden"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "RESPIRATION": [
         ("respiration_summary", "Respiration summary"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "CALORIES": [
         ("energy_expenditure", "Energy expenditure"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "ACTIGRAPHY_1": [
         ("activity_energy", "Activity energy"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "ACTIGRAPHY_2": [
         ("zero_crossing", "Zero-crossing activity"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "ACTIGRAPHY_3": [
         ("threshold_activity", "Time-above-threshold activity"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "ZERO_CROSSING": [
         ("zero_crossing", "Zero-crossing activity"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
 }
 
@@ -1184,6 +1465,20 @@ SENSOR_FEATURE_METRICS = {
         ("accuracy", "Location accuracy"),
         ("location_points", "Location record count"),
     ],
+    "LOCKUNLOCK": [
+        ("screen_time", "Screen-on time proxy"),
+        ("daily_usage_summary", "Subject-level mean / median daily screen-on proxy"),
+        ("records", "Event count"),
+        ("temporal_coverage", "Temporal coverage / active period"),
+        ("sampling", "Sampling interval / gaps"),
+    ],
+    "LOCK_UNLOCK": [
+        ("screen_time", "Screen-on time proxy"),
+        ("daily_usage_summary", "Subject-level mean / median daily screen-on proxy"),
+        ("records", "Event count"),
+        ("temporal_coverage", "Temporal coverage / active period"),
+        ("sampling", "Sampling interval / gaps"),
+    ],
     "PEDOMETER": [
         ("daily_steps", "Steps"),
         ("active_hours", "Active hours"),
@@ -1213,61 +1508,74 @@ SENSOR_FEATURE_METRICS = {
         ("bbi_hrv", "BBI/HRV time-domain metrics"),
         ("autonomic_variability", "Autonomic variability"),
         ("outliers", "Physiological outliers"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "ENHANCED_BBI": [
         ("bbi_hrv", "BBI/HRV time-domain metrics"),
         ("autonomic_variability", "Autonomic variability"),
         ("outliers", "Physiological outliers"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "HEART_RATE": [
         ("resting_hr", "Resting heart-rate proxy"),
         ("peak_hr", "Peak heart-rate proxy"),
         ("hr_variability", "Heart-rate variability/range"),
         ("outliers", "Brady/tachy range flags"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "HEARTRATE": [
         ("resting_hr", "Resting heart-rate proxy"),
         ("peak_hr", "Peak heart-rate proxy"),
         ("hr_variability", "Heart-rate variability/range"),
         ("outliers", "Brady/tachy range flags"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "HRV": [
         ("hrv_distribution", "HRV distribution"),
         ("autonomic_variability", "Autonomic variability"),
         ("outliers", "Physiological outliers"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "STRESS": [
         ("stress_burden", "Stress burden"),
         ("high_stress", "High-stress percentage"),
         ("recovery", "Low-stress/recovery percentage"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "SPO2": [
         ("spo2_summary", "SpO2 summary"),
         ("low_spo2", "Low-SpO2 burden"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "RESPIRATION": [
         ("respiration_summary", "Respiration summary"),
         ("night_mean", "Night-time mean"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "CALORIES": [
         ("energy_expenditure", "Energy expenditure"),
         ("active_calories", "Active/resting calories"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "ACTIGRAPHY_1": [
         ("activity_energy", "Activity energy"),
         ("activity_variability", "Activity variability"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "ACTIGRAPHY_2": [
         ("zero_crossing", "Zero-crossing activity"),
         ("activity_variability", "Activity variability"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "ACTIGRAPHY_3": [
         ("threshold_activity", "Time-above-threshold activity"),
         ("activity_variability", "Activity variability"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
     "ZERO_CROSSING": [
         ("zero_crossing", "Zero-crossing activity"),
         ("activity_variability", "Activity variability"),
+        ("wear_adherence", "On-wrist adherence"),
     ],
 }
 
@@ -1292,6 +1600,47 @@ def _norm(value: str | None) -> str:
 def _label_key(value: object) -> str:
     """Normalize labels for robust stream matching across folder names/columns."""
     return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+
+
+def _is_wrist_status_key(value: object) -> bool:
+    return _norm(str(value or "")) == "WRIST_STATUS"
+
+
+def _indexed_context_key(row: IndexedFile) -> tuple[str, str, str]:
+    return (str(row.study_id or ""), str(row.username or ""), str(row.device_id or ""))
+
+
+def _indexed_file_is_garmin(row: IndexedFile) -> bool:
+    return _norm(row.sensor_name) == "GARMIN"
+
+
+def _indexed_file_is_wrist_status(row: IndexedFile) -> bool:
+    return _indexed_file_is_garmin(row) and _is_wrist_status_key(row.wearable_sensor)
+
+
+def _augment_index_with_garmin_wrist(indexed_rows: list[IndexedFile]) -> list[IndexedFile]:
+    """Add Garmin WRIST_STATUS files from the same subject/device context."""
+    if not indexed_rows:
+        return indexed_rows
+    contexts = {
+        _indexed_context_key(row)
+        for row in indexed_rows
+        if _indexed_file_is_garmin(row) and not _indexed_file_is_wrist_status(row)
+    }
+    if not contexts:
+        return indexed_rows
+
+    out = list(indexed_rows)
+    seen = {str(row.source_file) for row in indexed_rows}
+    for row in _active_indexed_rows():
+        if str(row.source_file) in seen:
+            continue
+        if not _indexed_file_is_wrist_status(row):
+            continue
+        if _indexed_context_key(row) in contexts:
+            out.append(row)
+            seen.add(str(row.source_file))
+    return out
 
 
 def _row_get_ci(row: dict, keys: Iterable[str]) -> object:
@@ -1342,7 +1691,7 @@ def _display_sensor_choice(value: str | None) -> str | None:
 
 
 def _combined_sensor_choices() -> list[str]:
-    choices = available_filter_choices(APP_STATE.indexed_rows)
+    choices = available_filter_choices(_active_indexed_rows())
     values: set[str] = set()
     for raw in list(choices.get("sensor_name", [])) + list(choices.get("wearable_sensor", [])):
         cleaned = _display_sensor_choice(raw)
@@ -1607,6 +1956,8 @@ def _feature_choices_for_sensor(sensor_name: str | None) -> list[str]:
         return SENSOR_FEATURES[key]
     if "LOCATION" in key or "GPS" in key:
         return ["location_daily"]
+    if "LOCKUNLOCK" in key or "LOCK_UNLOCK" in key:
+        return ["lockunlock_daily"]
     if "PEDOMETER" in key or "STEP" in key:
         return ["pedometer_daily"]
     if key == "ACTIVITY" or "ACTIVITY" in key:
@@ -1637,6 +1988,8 @@ def _feature_metric_choices_for_sensor(sensor_name: str | None, feature_mode: st
             pairs.extend(SENSOR_FEATURE_METRICS[key])
         elif "LOCATION" in key or "GPS" in key:
             pairs.extend(SENSOR_FEATURE_METRICS["LOCATION"])
+        elif "LOCKUNLOCK" in key or "LOCK_UNLOCK" in key:
+            pairs.extend(SENSOR_FEATURE_METRICS["LOCKUNLOCK"])
         elif "PEDOMETER" in key or "STEP" in key:
             pairs.extend(SENSOR_FEATURE_METRICS["PEDOMETER"])
         elif key == "ACTIVITY" or "ACTIVITY" in key:
@@ -1651,6 +2004,8 @@ def _feature_metric_choices_for_sensor(sensor_name: str | None, feature_mode: st
             pairs.extend(CORE_SENSOR_FEATURE_METRICS[key])
         elif "LOCATION" in key or "GPS" in key:
             pairs.extend(CORE_SENSOR_FEATURE_METRICS["LOCATION"])
+        elif "LOCKUNLOCK" in key or "LOCK_UNLOCK" in key:
+            pairs.extend(CORE_SENSOR_FEATURE_METRICS["LOCKUNLOCK"])
         elif "PEDOMETER" in key or "STEP" in key:
             pairs.extend(CORE_SENSOR_FEATURE_METRICS["PEDOMETER"])
         elif key == "ACTIVITY" or "ACTIVITY" in key:
@@ -1698,6 +2053,7 @@ def _filter_feature_columns(rows: list[dict], sensor_name: str = "All", feature_
         "temporal_coverage": ["coverage", "observed", "active_hours", "duration_hours", "temporal"],
         "data_frequency": ["computed_frequency"],
         "sampling": ["sampling", "interval", "gap", "continuity"],
+        "wear_adherence": ["wrist_", "dominant_wrist_status"],
         "total_foreground": ["total_foreground"],
         "mean_foreground": ["mean_foreground"],
         "unique_apps": ["unique_apps"],
@@ -1708,6 +2064,8 @@ def _filter_feature_columns(rows: list[dict], sensor_name: str = "All", feature_
         "speed": ["speed", "movement"],
         "accuracy": ["accuracy"],
         "location_points": ["records", "location_points", "points"],
+        "screen_time": ["screen_time", "unlock_count", "session", "raw_on_events", "user_present_events", "screen_time_proxy", "proxy_available"],
+        "daily_usage_summary": ["mean_per_day_screen_time", "median_per_day_screen_time"],
         "daily_steps": ["daily_steps", "steps"],
         "active_hours": ["active_hours"],
         "sedentary_hours": ["sedentary", "zero_step"],
@@ -1787,35 +2145,37 @@ def _default_feature_names_for_sensor(sensor_name: str | None, feature_mode: str
     if mode == "custom":
         return ["custom_script"]
     if mode == "qc":
-        return ["records", "temporal_coverage", "data_frequency"]
+        return ["records", "temporal_coverage", "data_frequency", "wear_adherence"]
     if mode == "advanced":
         return ["mean", "median", "std", "percentiles"]
     if "APP" in key or "USAGE" in key:
         return ["total_foreground", "category", "unique_apps"]
     if "LOCATION" in key or "GPS" in key:
         return ["daily_distance", "mobility"]
+    if "LOCKUNLOCK" in key or "LOCK_UNLOCK" in key:
+        return ["screen_time", "daily_usage_summary"]
     if "PEDOMETER" in key or "STEP" in key:
         return ["daily_steps", "active_hours"]
     if key == "ACTIVITY" or "ACTIVITY" in key:
         return ["activity_time", "activity_share"]
     if key in {"BBI", "ENHANCED_BBI", "HRV"}:
-        return ["bbi_hrv", "outliers"]
+        return ["bbi_hrv", "outliers", "wear_adherence"]
     if key in {"HEART_RATE", "HEARTRATE", "HR"}:
-        return ["resting_hr", "peak_hr", "hr_variability"]
+        return ["resting_hr", "peak_hr", "hr_variability", "wear_adherence"]
     if "SPO2" in key or "PULSE" in key:
-        return ["spo2_summary", "low_spo2"]
+        return ["spo2_summary", "low_spo2", "wear_adherence"]
     if "STRESS" in key:
-        return ["stress_burden", "high_stress", "recovery"]
+        return ["stress_burden", "high_stress", "recovery", "wear_adherence"]
     if "RESP" in key:
-        return ["respiration_summary"]
+        return ["respiration_summary", "wear_adherence"]
     if "CALOR" in key:
-        return ["energy_expenditure"]
+        return ["energy_expenditure", "wear_adherence"]
     if "ACTIGRAPHY" in key or "ZERO_CROSSING" in key:
         if "2" in key or "ZERO_CROSSING" in key:
-            return ["zero_crossing"]
+            return ["zero_crossing", "wear_adherence"]
         if "3" in key:
-            return ["threshold_activity"]
-        return ["activity_energy"]
+            return ["threshold_activity", "wear_adherence"]
+        return ["activity_energy", "wear_adherence"]
     return ["mean", "median", "percentiles"]
 
 
@@ -2002,7 +2362,7 @@ def _select_options_plain(values: Iterable[str], selected: str | None = None, se
 
 
 def _filter_index_for_feature(username: str = "All", sensor_name: str = "All") -> list[IndexedFile]:
-    rows = APP_STATE.indexed_rows
+    rows = _active_indexed_rows()
     if username != "All":
         rows = [row for row in rows if row.username == username]
     if sensor_name != "All":
@@ -2058,6 +2418,7 @@ def _is_identifier_or_metadata_column(col: str) -> bool:
         "temporal_frequency", "timestamp", "timestamp_start", "timestamp_end",
         "analysis_time_ms", "analysis_time_iso", "starttime", "endtime", "start_time",
         "end_time", "lasttimeused", "begintimestamp", "endtimestamp",
+        "wrist_status", "wrist_status_source", "wrist_status_match_sec", "wrist_status_numeric",
     }:
         return True
     if key.endswith("_id") or key.endswith("id"):
@@ -2132,6 +2493,142 @@ def _time_ms_for_row(row: dict) -> float | None:
         if value is not None:
             return value * 1000.0 if abs(value) < 1e11 else value
     return None
+
+
+def _row_end_time_ms(row: dict) -> float | None:
+    for key in ("timestamp_end", "endTime", "end_time", "endTimeStamp", "endTimestamp"):
+        value = _row_get_float_ci(row, [key])
+        if value is None:
+            continue
+        if abs(value) < 1e11:
+            value *= 1000
+        return value
+    return _time_ms_for_row(row)
+
+
+def _is_wrist_status_row(row: dict) -> bool:
+    return _is_wrist_status_key(_row_get_ci(row, ["wearable_sensor", "sensor", "sensorname", "sensor_name"]))
+
+
+def _parse_wrist_status_state(raw: object) -> tuple[str, float | None]:
+    if raw in (None, ""):
+        return "unknown", None
+    text = str(raw).strip()
+    if not text:
+        return "unknown", None
+    token = text.split(",", 1)[0].strip()
+    key = _label_key(token)
+    if any(flag in key for flag in ("ONWRIST", "ONBODY", "WORN", "WEARING", "TRUE", "YES")):
+        return "on_wrist", 1.0
+    if any(flag in key for flag in ("OFFWRIST", "NOTWORN", "REMOVED", "FALSE", "NO")):
+        return "off_wrist", 0.0
+    num = _safe_float(token)
+    if num is not None:
+        if num >= 1:
+            return "on_wrist", 1.0
+        if num <= 0:
+            return "off_wrist", 0.0
+    return "unknown", None
+
+
+def _annotate_rows_with_garmin_wrist_status(rows: list[dict]) -> list[dict]:
+    if not rows:
+        return rows
+
+    wrist_rows = [row for row in rows if _is_wrist_status_row(row)]
+    if not wrist_rows:
+        return rows
+
+    wrist_by_context: dict[tuple[str, str, str], list[dict]] = {}
+    for row in wrist_rows:
+        start_ms = _time_ms_for_row(row)
+        if start_ms is None:
+            continue
+        end_ms = _row_end_time_ms(row)
+        if end_ms is None or end_ms < start_ms:
+            end_ms = start_ms
+        state, numeric = _parse_wrist_status_state(
+            _row_get_ci(row, ["wristStatus", "wearState", "wornState", "isOnWrist", "value", "status"])
+        )
+        wrist_by_context.setdefault(
+            (
+                str(_row_get_ci(row, ["studyId", "study_id"]) or ""),
+                _subject_label(row),
+                str(_row_get_ci(row, ["deviceid", "device_id"]) or ""),
+            ),
+            [],
+        ).append(
+            {
+                "start_ms": float(start_ms),
+                "end_ms": float(end_ms),
+                "mid_ms": float(start_ms + (end_ms - start_ms) / 2.0),
+                "state": state,
+                "numeric": numeric,
+            }
+        )
+
+    for items in wrist_by_context.values():
+        items.sort(key=lambda entry: (entry["start_ms"], entry["end_ms"]))
+
+    annotated: list[dict] = []
+    for row in rows:
+        out = dict(row)
+        if _is_wrist_status_row(out):
+            state, numeric = _parse_wrist_status_state(
+                _row_get_ci(out, ["wristStatus", "wearState", "wornState", "isOnWrist", "value", "status"])
+            )
+            out["wrist_status"] = state
+            out["wrist_status_numeric"] = numeric
+            out["wrist_status_match_sec"] = 0.0
+            out["wrist_status_source"] = "garmin_wrist_status_stream"
+            annotated.append(out)
+            continue
+
+        context = (
+            str(_row_get_ci(out, ["studyId", "study_id"]) or ""),
+            _subject_label(out),
+            str(_row_get_ci(out, ["deviceid", "device_id"]) or ""),
+        )
+        candidates = wrist_by_context.get(context, [])
+        if not candidates:
+            annotated.append(out)
+            continue
+
+        t_ms = _time_ms_for_row(out)
+        if t_ms is None:
+            annotated.append(out)
+            continue
+
+        matched = next((item for item in candidates if item["start_ms"] <= t_ms <= item["end_ms"]), None)
+        if matched is None:
+            nearest = min(candidates, key=lambda item: abs(item["mid_ms"] - t_ms))
+            if abs(nearest["mid_ms"] - t_ms) <= 12 * 3600 * 1000:
+                matched = nearest
+        if matched is not None:
+            out["wrist_status"] = matched["state"]
+            out["wrist_status_numeric"] = matched["numeric"]
+            out["wrist_status_match_sec"] = round(abs(matched["mid_ms"] - t_ms) / 1000.0, 3)
+            out["wrist_status_source"] = "matched_garmin_wrist_status"
+        annotated.append(out)
+    return annotated
+
+
+def _load_rows_for_scope(
+    indexed_rows: list[IndexedFile],
+    selected_sensor: str = "All",
+    progress_callback=None,
+) -> list[dict]:
+    scoped_index = _augment_index_with_garmin_wrist(indexed_rows)
+    if progress_callback:
+        progress_callback(0, len(scoped_index), "Preparing the selected data scope...")
+    loaded_rows = load_indexed_json_rows(scoped_index, progress_callback=progress_callback)
+    if progress_callback:
+        progress_callback(len(scoped_index), len(scoped_index), "Linking Garmin wrist-status records where available...")
+    loaded_rows = _annotate_rows_with_garmin_wrist_status(loaded_rows)
+    sensor_key = _norm(selected_sensor)
+    if sensor_key not in {"", "ALL", "WRIST_STATUS"}:
+        loaded_rows = [row for row in loaded_rows if not _is_wrist_status_row(row)]
+    return loaded_rows
 
 
 def _sensor_numeric_value(row: dict, numeric_cols: list[str]) -> tuple[str | None, float | None]:
@@ -2411,6 +2908,274 @@ def _activity_features(
         out.append(item)
     return out
 
+
+def _lockunlock_event_state(row: dict) -> str | None:
+    raw = _row_get_ci(row, ["screenEvent", "event", "screen_state", "screenState", "state", "value"])
+    if raw in (None, ""):
+        return None
+    text = str(raw).strip()
+    key = _label_key(text)
+    if key in {"ON", "SCREENON", "UNLOCK", "UNLOCKED"}:
+        return "on"
+    if key in {"OFF", "SCREENOFF", "LOCK", "LOCKED"}:
+        return "off"
+    if key in {"PRESENT", "USERPRESENT", "USER_PRESENT"}:
+        return "present"
+    value = _safe_float(text)
+    if value is not None:
+        if value >= 1:
+            return "on"
+        if value <= 0:
+            return "off"
+    return None
+
+
+def _split_session_across_days(start_dt: datetime, end_dt: datetime) -> list[dict]:
+    if end_dt <= start_dt:
+        return []
+
+    segments: list[dict] = []
+    current_start = start_dt
+    while current_start.date() < end_dt.date():
+        next_midnight = current_start.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        duration_sec = max(0.0, (next_midnight - current_start).total_seconds())
+        if duration_sec > 0:
+            segments.append(
+                {
+                    "date": current_start.date(),
+                    "segment_start_dt": current_start,
+                    "segment_end_dt": next_midnight,
+                    "duration_sec": duration_sec,
+                }
+            )
+        current_start = next_midnight
+
+    final_duration_sec = max(0.0, (end_dt - current_start).total_seconds())
+    if final_duration_sec > 0:
+        segments.append(
+            {
+                "date": current_start.date(),
+                "segment_start_dt": current_start,
+                "segment_end_dt": end_dt,
+                "duration_sec": final_duration_sec,
+            }
+        )
+    return segments
+
+
+def _lockunlock_daily_features(
+    rows: list[dict],
+    temporal_frequency: str = "daily",
+    selected_features: Iterable[str] | None = None,
+) -> list[dict]:
+    if not rows:
+        return []
+
+    temporal_frequency = (temporal_frequency or "daily").lower()
+    if temporal_frequency not in {"daily", "monthly", "study_duration"}:
+        temporal_frequency = "daily"
+
+    prepared_by_subject: dict[str, list[dict]] = {}
+    for row in rows:
+        event = _lockunlock_event_state(row)
+        timestamp_ms = _time_ms_for_row(row)
+        if event is None or timestamp_ms is None:
+            continue
+        subject = _subject_label(row)
+        prepared_by_subject.setdefault(subject, []).append(
+            {
+                "subject": subject,
+                "timestamp_ms": float(timestamp_ms),
+                "event": event,
+                "datetime_utc": datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc),
+            }
+        )
+
+    if not prepared_by_subject:
+        return []
+
+    out: list[dict] = []
+    for subject, items in sorted(prepared_by_subject.items(), key=lambda kv: str(kv[0])):
+        items.sort(key=lambda item: item["timestamp_ms"])
+
+        deduped: list[dict] = []
+        last_kept: dict | None = None
+        for item in items:
+            if last_kept is not None:
+                same_event = item["event"] == last_kept["event"]
+                same_time = item["timestamp_ms"] == last_kept["timestamp_ms"]
+                rapid_repeat = same_event and (item["timestamp_ms"] - last_kept["timestamp_ms"]) <= 5000.0
+                if same_time and same_event:
+                    continue
+                if rapid_repeat:
+                    continue
+            deduped.append(item)
+            last_kept = item
+
+        sessions: list[dict] = []
+        current_on_ms: float | None = None
+        for item in deduped:
+            event = item["event"]
+            timestamp_ms = item["timestamp_ms"]
+            if event == "on":
+                current_on_ms = timestamp_ms
+            elif current_on_ms is not None and timestamp_ms >= current_on_ms:
+                duration_sec = (timestamp_ms - current_on_ms) / 1000.0
+                if 0.0 <= duration_sec <= 12 * 3600:
+                    start_dt = datetime.fromtimestamp(current_on_ms / 1000.0, tz=timezone.utc)
+                    end_dt = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
+                    sessions.append(
+                        {
+                            "date": start_dt.date(),
+                            "start_dt": start_dt,
+                            "end_dt": end_dt,
+                            "duration_sec": duration_sec,
+                            "segments": _split_session_across_days(start_dt, end_dt),
+                        }
+                    )
+                current_on_ms = None
+
+        on_events_per_day: dict[object, int] = {}
+        present_events_per_day: dict[object, int] = {}
+        off_events_per_day: dict[object, int] = {}
+        for item in deduped:
+            key = item["datetime_utc"].date()
+            if item["event"] == "on":
+                on_events_per_day[key] = on_events_per_day.get(key, 0) + 1
+            elif item["event"] == "present":
+                present_events_per_day[key] = present_events_per_day.get(key, 0) + 1
+            elif item["event"] == "off":
+                off_events_per_day[key] = off_events_per_day.get(key, 0) + 1
+
+        sessions_by_day: dict[object, list[dict]] = {}
+        segments_by_day: dict[object, list[dict]] = {}
+        for session in sessions:
+            sessions_by_day.setdefault(session["date"], []).append(session)
+            for segment in session.get("segments", []):
+                segments_by_day.setdefault(segment["date"], []).append(segment)
+
+        subject_days = sorted(
+            set(sessions_by_day.keys())
+            | set(segments_by_day.keys())
+            | set(on_events_per_day.keys())
+            | set(present_events_per_day.keys())
+            | set(off_events_per_day.keys())
+        )
+        if not subject_days:
+            continue
+        first_day = min(subject_days)
+        daily_rows: list[dict] = []
+        for day in subject_days:
+            day_sessions = sessions_by_day.get(day, [])
+            day_segments = segments_by_day.get(day, [])
+            segment_durations_sec = [
+                float(segment["duration_sec"])
+                for segment in day_segments
+                if math.isfinite(float(segment["duration_sec"]))
+            ]
+            started_durations_sec = [
+                float(session["duration_sec"])
+                for session in day_sessions
+                if math.isfinite(float(session["duration_sec"]))
+            ]
+            total_hours = sum(segment_durations_sec) / 3600.0
+            mean_session_min = None
+            median_session_min = None
+            if started_durations_sec:
+                mean_session_min = (sum(started_durations_sec) / len(started_durations_sec)) / 60.0
+                median_value = _safe_stats(started_durations_sec)["median"]
+                median_session_min = (median_value / 60.0) if median_value is not None else None
+            present_count = int(present_events_per_day.get(day, 0))
+            on_count = int(on_events_per_day.get(day, len(day_sessions)))
+            off_count = int(off_events_per_day.get(day, 0))
+            proxy_available = bool(segment_durations_sec)
+            daily_rows.append(
+                {
+                    "Subject_ID": subject,
+                    "Study_day": int((day - first_day).days),
+                    "Date": day.isoformat(),
+                    "time_bin": day.isoformat(),
+                    "temporal_frequency": "daily",
+                    "unlock_count": present_count if present_count > 0 else len(day_sessions),
+                    "screen_on_session_count": len(day_sessions),
+                    "total_screen_time_hours": round(total_hours, 4),
+                    "mean_session_min": round(mean_session_min, 4) if mean_session_min is not None else None,
+                    "median_session_min": round(median_session_min, 4) if median_session_min is not None else None,
+                    "raw_on_events": on_count,
+                    "raw_off_events": off_count,
+                    "user_present_events": present_count,
+                    "screen_time_proxy_available": "TRUE" if proxy_available else "FALSE",
+                    "screen_time_method": "interactive_on_off_proxy",
+                    "_daily_total_screen_time_hours": total_hours,
+                    "_day_sessions": day_sessions,
+                    "_proxy_available": proxy_available,
+                }
+            )
+
+        if not daily_rows:
+            continue
+
+        daily_hours = [
+            float(row["_daily_total_screen_time_hours"])
+            for row in daily_rows
+            if bool(row.get("_proxy_available"))
+        ]
+        daily_hours_stats = _safe_stats(daily_hours)
+        mean_per_day = daily_hours_stats["mean"]
+        median_per_day = daily_hours_stats["median"]
+        for row in daily_rows:
+            row["subject_mean_per_day_screen_time_hours"] = round(mean_per_day, 4) if mean_per_day is not None else None
+            row["subject_median_per_day_screen_time_hours"] = round(median_per_day, 4) if median_per_day is not None else None
+
+        if temporal_frequency == "daily":
+            for row in daily_rows:
+                row.pop("_daily_total_screen_time_hours", None)
+                row.pop("_day_sessions", None)
+                row.pop("_proxy_available", None)
+                out.append(row)
+            continue
+
+        grouped_rows: dict[str, list[dict]] = {}
+        for row in daily_rows:
+            day = datetime.fromisoformat(str(row["Date"])).date()
+            if temporal_frequency == "monthly":
+                label = day.strftime("%Y-%m")
+            else:
+                label = "Full study duration"
+            grouped_rows.setdefault(label, []).append(row)
+
+        for label, bucket in sorted(grouped_rows.items(), key=lambda kv: str(kv[0])):
+            bucket_hours = [float(row["_daily_total_screen_time_hours"]) for row in bucket]
+            bucket_hour_stats = _safe_stats(bucket_hours)
+            bucket_sessions = [
+                session
+                for row in bucket
+                for session in row.get("_day_sessions", [])
+            ]
+            session_durations = [float(session["duration_sec"]) for session in bucket_sessions if math.isfinite(float(session["duration_sec"]))]
+            session_stats = _safe_stats(session_durations) if session_durations else {}
+            item = {
+                "Subject_ID": subject,
+                "time_bin": label,
+                "temporal_frequency": temporal_frequency,
+                "unlock_count": sum(int(row.get("unlock_count", 0) or 0) for row in bucket),
+                "screen_on_session_count": sum(int(row.get("screen_on_session_count", 0) or 0) for row in bucket),
+                "raw_on_events": sum(int(row.get("raw_on_events", 0) or 0) for row in bucket),
+                "raw_off_events": sum(int(row.get("raw_off_events", 0) or 0) for row in bucket),
+                "user_present_events": sum(int(row.get("user_present_events", 0) or 0) for row in bucket),
+                "total_screen_time_hours": round(sum(bucket_hours), 4),
+                "subject_mean_per_day_screen_time_hours": round(bucket_hour_stats["mean"], 4) if bucket_hour_stats.get("mean") is not None else None,
+                "subject_median_per_day_screen_time_hours": round(bucket_hour_stats["median"], 4) if bucket_hour_stats.get("median") is not None else None,
+                "screen_time_proxy_available": "TRUE" if any(bool(row.get("_proxy_available")) for row in bucket) else "FALSE",
+                "screen_time_method": "interactive_on_off_proxy",
+            }
+            if _has_selected_metric(selected_features, "screen_time") and session_durations:
+                item["mean_session_min"] = round((session_stats.get("mean") or 0.0) / 60.0, 4)
+                item["median_session_min"] = round((session_stats.get("median") or 0.0) / 60.0, 4)
+            out.append(item)
+
+    return out
+
 def _generic_sensor_daily_features(
     rows: list[dict],
     sensor_name: str = "All",
@@ -2439,8 +3204,9 @@ def _generic_sensor_daily_features(
     temporal_frequency = (temporal_frequency or "daily").lower()
     for row in rows:
         key = _temporal_key(row, temporal_frequency)
-        g = groups.setdefault(key, {"cols": {col: [] for col in numeric_cols}, "times": [], "sensor_vals": [], "row_count": 0})
+        g = groups.setdefault(key, {"cols": {col: [] for col in numeric_cols}, "times": [], "sensor_vals": [], "row_count": 0, "rows": []})
         g["row_count"] += 1
+        g["rows"].append(row)
         t = _time_ms_for_row(row)
         if t is not None:
             g["times"].append(t)
@@ -2484,6 +3250,28 @@ def _generic_sensor_daily_features(
                         item["long_gap_count"] = sum(x > max(300, 3 * med) for x in intervals) if med else 0
         primary_vals = group.get("sensor_vals", [])
         _add_sensor_specific_features(item, _norm(sensor_name), primary_vals, times, selected_features=selected_features)
+        if _has_selected_metric(selected_features, "wear_adherence"):
+            wear_states = [
+                str(row.get("wrist_status") or "").strip().lower()
+                for row in group.get("rows", [])
+                if str(row.get("wrist_status") or "").strip()
+            ]
+            if wear_states:
+                on_count = sum(state == "on_wrist" for state in wear_states)
+                off_count = sum(state == "off_wrist" for state in wear_states)
+                unknown_count = sum(state == "unknown" for state in wear_states)
+                total_count = len(wear_states)
+                item["wrist_status_available_records"] = total_count
+                item["wrist_on_records"] = on_count
+                item["wrist_off_records"] = off_count
+                item["wrist_unknown_records"] = unknown_count
+                item["wrist_on_pct"] = round((100.0 * on_count / total_count), 4)
+                item["wrist_off_pct"] = round((100.0 * off_count / total_count), 4)
+                item["dominant_wrist_status"] = (
+                    "on_wrist"
+                    if on_count >= max(off_count, unknown_count)
+                    else ("off_wrist" if off_count >= unknown_count else "unknown")
+                )
         for col, vals in group["cols"].items():
             if not vals:
                 continue
@@ -2834,6 +3622,8 @@ def _generated_feature_rows(feature_key: str | None = None, use_qc: bool = False
         rows = APP_STATE.app_usage_category_daily_wide
     elif key == "location_daily":
         rows = APP_STATE.location_daily
+    elif key == "lockunlock_daily":
+        rows = APP_STATE.lockunlock_daily
     elif key == "pedometer_daily":
         rows = APP_STATE.pedometer_daily
     elif key == "sensor_daily_summary":
@@ -2845,7 +3635,7 @@ def _generated_feature_rows(feature_key: str | None = None, use_qc: bool = False
     elif APP_STATE.feature_qc_rows:
         rows = APP_STATE.feature_qc_rows
     else:
-        for candidate in (APP_STATE.app_usage_daily, APP_STATE.app_usage_category_daily_wide, APP_STATE.location_daily, APP_STATE.pedometer_daily, APP_STATE.generic_sensor_daily, APP_STATE.activity_features, APP_STATE.custom_feature_rows):
+        for candidate in (APP_STATE.app_usage_daily, APP_STATE.app_usage_category_daily_wide, APP_STATE.location_daily, APP_STATE.lockunlock_daily, APP_STATE.pedometer_daily, APP_STATE.generic_sensor_daily, APP_STATE.activity_features, APP_STATE.custom_feature_rows):
             if candidate:
                 rows = candidate
                 break
@@ -2966,11 +3756,43 @@ def _group_filter_label(value: object) -> str:
     return "All" if not selected else ", ".join(selected)
 
 
+def _normalize_wear_state_filter(value: object) -> str:
+    text = str(value or "All").strip().lower()
+    if text in {"", "all"}:
+        return "All"
+    if text in {"on", "on_wrist", "worn"}:
+        return "on_wrist"
+    if text in {"off", "off_wrist", "not_worn", "removed"}:
+        return "off_wrist"
+    return "unknown"
+
+
+def _row_wear_state(row: dict) -> str:
+    for key in ("wrist_status", "dominant_wrist_status"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return _normalize_wear_state_filter(value)
+    return "unknown"
+
+
+def _filter_rows_by_wear_state(rows: list[dict], wear_state: str = "All") -> list[dict]:
+    selected = _normalize_wear_state_filter(wear_state)
+    if selected == "All":
+        return rows
+    return [row for row in rows if _row_wear_state(row) == selected]
+
+
 def _row_group_values(row: dict) -> set[str]:
     return {str(row.get(c, "")) for c in ("cohort", "group", "group_label", "condition") if row.get(c) not in (None, "")}
 
 
-def _filtered_feature_rows(feature_key: str | None = None, subject: str = "All", feature_column: str = "All", cohort: object = "All") -> list[dict]:
+def _filtered_feature_rows(
+    feature_key: str | None = None,
+    subject: str = "All",
+    feature_column: str = "All",
+    cohort: object = "All",
+    wear_state: str = "All",
+) -> list[dict]:
     rows = list(_generated_feature_rows(feature_key, use_qc=True))
     if subject != "All":
         rows = [row for row in rows if subject in {str(row.get(c, "")) for c in ("Subject_ID", "username", "subject", "participant")}]
@@ -2978,8 +3800,13 @@ def _filtered_feature_rows(feature_key: str | None = None, subject: str = "All",
     if selected_groups:
         selected_set = set(selected_groups)
         rows = [row for row in rows if _row_group_values(row) & selected_set]
+    rows = _filter_rows_by_wear_state(rows, wear_state)
     if feature_column != "All":
-        keep = ["Subject_ID", "username", "Study_day", "Date", "time_bin", "temporal_frequency", "cohort", "group", "group_label", feature_column]
+        keep = [
+            "Subject_ID", "username", "Study_day", "Date", "time_bin", "temporal_frequency",
+            "cohort", "group", "group_label", "wrist_on_pct", "wrist_off_pct",
+            "wrist_status_available_records", "dominant_wrist_status", feature_column,
+        ]
         rows = [{k: row.get(k) for k in keep if k in row} for row in rows]
     return rows
 
@@ -3179,6 +4006,8 @@ def _raw_sensor_points(rows: list[dict], feature_column: str = "All") -> list[di
             "sensor": _row_sensor_label(row),
             "group": row.get("group_label") or row.get("cohort") or row.get("group") or "",
             "source_file": row.get("source_file") or "",
+            "wrist_status": _row_wear_state(row),
+            "wrist_status_match_sec": row.get("wrist_status_match_sec"),
         })
     return sorted(out, key=lambda item: (item["Subject_ID"], item["sensor"], item["time"]))
 
@@ -3197,6 +4026,15 @@ def _plotly_export_config(filename: str, height: int = 900, width: int = 1500) -
             "scale": 2,
         },
     }
+
+
+def _wrist_status_color(state: str) -> str:
+    state = _normalize_wear_state_filter(state)
+    if state == "on_wrist":
+        return "#1f9d55"
+    if state == "off_wrist":
+        return "#c0392b"
+    return "#7f8c8d"
 
 
 def _apply_scientific_layout(fig: go.Figure, title: str, x_title: str = "Time", y_title: str = "Value", height: int = 640) -> go.Figure:
@@ -3238,18 +4076,19 @@ def _raw_time_series_plot_div(rows: list[dict], feature_column: str = "All", plo
         pts = sorted(pts, key=lambda p: p["time"])
         x_vals = [p["time"] for p in pts]
         y_vals = [p["value"] for p in pts]
-        custom = [[p["Subject_ID"], p["sensor"], p["value_col"], p["group"], p.get("source_file", "")] for p in pts]
+        marker_colors = [_wrist_status_color(str(p.get("wrist_status", "unknown"))) for p in pts]
+        custom = [[p["Subject_ID"], p["sensor"], p["value_col"], p["group"], p.get("source_file", ""), p.get("wrist_status", "unknown")] for p in pts]
         hover = (
             "Subject: %{customdata[0]}<br>Sensor: %{customdata[1]}<br>Time: %{x}<br>"
-            "Field: %{customdata[2]}<br>Value: %{y:.4g}<br>Group: %{customdata[3]}<extra></extra>"
+            "Field: %{customdata[2]}<br>Value: %{y:.4g}<br>Group: %{customdata[3]}<br>Wear state: %{customdata[5]}<extra></extra>"
         )
         if plot_type in {"raw_scatter", "scatter"}:
-            fig.add_trace(go.Scattergl(x=x_vals, y=y_vals, mode="markers", marker=dict(size=5, opacity=0.70), name=name, customdata=custom, hovertemplate=hover))
+            fig.add_trace(go.Scattergl(x=x_vals, y=y_vals, mode="markers", marker=dict(size=5, opacity=0.75, color=marker_colors), name=name, customdata=custom, hovertemplate=hover))
         elif plot_type in {"raw_bar", "bar"}:
             fig.add_trace(go.Bar(x=x_vals, y=y_vals, name=name, customdata=custom, hovertemplate=hover))
         else:
             mode = "lines" if len(pts) > 250 else "lines+markers"
-            marker = dict(size=4, opacity=0.75)
+            marker = dict(size=4, opacity=0.85, color=marker_colors)
             fig.add_trace(go.Scattergl(x=x_vals, y=y_vals, mode=mode, marker=marker, line=dict(width=1.8), name=name, customdata=custom, hovertemplate=hover))
     y_title = _clean_feature_label(feature_column if feature_column not in {"", "All", None} else "Raw sensor value")
     _apply_scientific_layout(fig, "Raw sensor time series", "Time", y_title, height=660)
@@ -3292,13 +4131,13 @@ def _raw_panel_plot_div(rows: list[dict], feature_column: str = "All") -> str:
                     x=[p["time"] for p in pts],
                     y=[p["value"] for p in pts],
                     mode="lines" if len(pts) > 250 else "lines+markers",
-                    marker=dict(size=4, opacity=0.70),
+                    marker=dict(size=4, opacity=0.80, color=[_wrist_status_color(str(p.get("wrist_status", "unknown"))) for p in pts]),
                     line=dict(width=1.6),
                     name=subject,
                     legendgroup=subject,
                     showlegend=idx == 1,
-                    customdata=[[p["sensor"], p["value_col"]] for p in pts],
-                    hovertemplate="Subject: %{fullData.name}<br>Sensor: %{customdata[0]}<br>Field: %{customdata[1]}<br>Time: %{x}<br>Value: %{y:.4g}<extra></extra>",
+                    customdata=[[p["sensor"], p["value_col"], p.get("wrist_status", "unknown")] for p in pts],
+                    hovertemplate="Subject: %{fullData.name}<br>Sensor: %{customdata[0]}<br>Field: %{customdata[1]}<br>Wear state: %{customdata[2]}<br>Time: %{x}<br>Value: %{y:.4g}<extra></extra>",
                 ),
                 row=idx,
                 col=1,
@@ -4070,7 +4909,7 @@ def _subject_context_rows(rows: list[dict]) -> list[dict]:
     if not _has_location_like(out):
         reloaded: list[dict] = []
         for subj in subjects:
-            indexed = filter_indexed_files(APP_STATE.indexed_rows, username=subj, sensor_name="All")
+            indexed = filter_indexed_files(_active_indexed_rows(), username=subj, sensor_name="All")
             if indexed:
                 reloaded.extend(load_indexed_json_rows(indexed))
         if reloaded:
@@ -4933,6 +5772,8 @@ def _raw_sensor_points_for_dashboard(subject: str = "All", sensor_name: str | No
             "value": val,
             "value_col": value_col or "value",
             "sensor": sensor_name,
+            "wrist_status": _row_wear_state(row),
+            "wrist_status_match_sec": row.get("wrist_status_match_sec"),
         })
     return sorted(out, key=lambda item: (item["Subject_ID"], item["time"]))
 
@@ -4941,6 +5782,7 @@ def _sensor_dashboard_plot_div(rows: list[dict], feature_column: str, subject: s
     raw_points = _raw_sensor_points_for_dashboard(subject=subject, sensor_name=sensor_name, feature_column=feature_column)
     if not raw_points:
         return _feature_plot_div(rows, feature_column, "line")
+    wear_states = [str(point.get("wrist_status", "unknown")) for point in raw_points if str(point.get("wrist_status", "unknown")) != "unknown"]
     fig = make_subplots(
         rows=2,
         cols=2,
@@ -4959,8 +5801,9 @@ def _sensor_dashboard_plot_div(rows: list[dict], feature_column: str, subject: s
                 y=[p["value"] for p in pts],
                 mode="lines+markers",
                 name=subject,
-                customdata=[[p["value_col"]] for p in pts],
-                hovertemplate="Subject: %{fullData.name}<br>Time: %{x}<br>Value: %{y}<br>Source field: %{customdata[0]}<extra></extra>",
+                marker=dict(color=[_wrist_status_color(str(p.get("wrist_status", "unknown"))) for p in pts], size=6),
+                customdata=[[p["value_col"], p.get("wrist_status", "unknown")] for p in pts],
+                hovertemplate="Subject: %{fullData.name}<br>Time: %{x}<br>Value: %{y}<br>Source field: %{customdata[0]}<br>Wear state: %{customdata[1]}<extra></extra>",
             ),
             row=1,
             col=1,
@@ -5003,6 +5846,20 @@ def _sensor_dashboard_plot_div(rows: list[dict], feature_column: str, subject: s
         legend_title="Participant",
         margin=dict(l=60, r=30, t=90, b=60),
     )
+    if wear_states:
+        on_count = sum(state == "on_wrist" for state in wear_states)
+        off_count = sum(state == "off_wrist" for state in wear_states)
+        fig.add_annotation(
+            text=f"Matched wrist-state context: on-wrist {on_count} points, off-wrist {off_count} points",
+            xref="paper",
+            yref="paper",
+            x=0.01,
+            y=1.10,
+            showarrow=False,
+            align="left",
+            bgcolor="rgba(255,255,255,0.88)",
+            bordercolor="rgba(31,41,55,0.18)",
+        )
     fig.update_yaxes(title_text="Raw value", row=1, col=1)
     fig.update_yaxes(title_text=_clean_feature_label(feature_column), row=2, col=1)
     fig.update_yaxes(title_text="Records", row=2, col=2)
@@ -5079,7 +5936,7 @@ def _app_category_tools_html(
     """
 
 def _step3_page(username: str = "All", sensor_name: str = "All", feature_name: str = "all", temporal_frequency: str = "daily", feature_mode: str = "core") -> HTMLResponse:
-    choices = available_filter_choices(APP_STATE.indexed_rows)
+    choices = available_filter_choices(_active_indexed_rows())
     sensor_choices = _combined_sensor_choices()
     if feature_mode not in {value for value, _ in FEATURE_MODE_CHOICES}:
         feature_mode = "core"
@@ -5119,7 +5976,7 @@ def _step3_page(username: str = "All", sensor_name: str = "All", feature_name: s
         if current_rows else "No feature set has been computed yet."
     )
     step3_matches = [
-        row for row in APP_STATE.indexed_rows
+        row for row in _active_indexed_rows()
         if (username == "All" or getattr(row, "username", "") == username)
         and (sensor_name == "All" or getattr(row, "sensorname", "") == sensor_name or getattr(row, "wearable_sensor", "") == sensor_name)
     ]
@@ -5827,6 +6684,7 @@ def _step5_page(
     subject: str = "All",
     feature_column: str = "All",
     plot_type: str = "mean_ci",
+    wear_state: str = "All",
     cohort: str = "All",
     sensor_name: str = "All",
     temporal_frequency: str = "All",
@@ -5855,6 +6713,7 @@ def _step5_page(
         if subject not in subjects:
             subject = "All"
         filtered_rows = _raw_rows_filtered(subject=subject, sensor_name="All", cohort="All")
+        filtered_rows = _filter_rows_by_wear_state(filtered_rows, wear_state)
         numeric_cols = _raw_numeric_columns(filtered_rows or base_rows)
         if feature_column != "All" and feature_column not in numeric_cols:
             feature_column = "All"
@@ -5875,14 +6734,14 @@ def _step5_page(
             subject = "All"
         if feature_column != "All" and feature_column not in numeric_cols:
             feature_column = "All"
-        filtered_rows = _filtered_feature_rows(feature_key, subject=subject, feature_column=feature_column, cohort="All")
+        filtered_rows = _filtered_feature_rows(feature_key, subject=subject, feature_column=feature_column, cohort="All", wear_state=wear_state)
         filtered_rows = _filter_rows_by_temporal_frequency(filtered_rows, temporal_frequency)
 
         plot_pairs = _compatible_generated_plot_pairs(feature_key, base_rows, temporal_frequency, feature_column)
         valid_generated_plots = {value for value, _label in plot_pairs}
         if plot_type not in valid_generated_plots or plot_type.startswith("raw_"):
             plot_type = plot_pairs[0][0] if plot_pairs else "mean_ci"
-        plot_rows = _filtered_feature_rows(feature_key, subject=subject, cohort="All")
+        plot_rows = _filtered_feature_rows(feature_key, subject=subject, cohort="All", wear_state=wear_state)
         plot_rows = _filter_rows_by_temporal_frequency(plot_rows, temporal_frequency)
         transformed_filtered_rows, transformed_column, transform_info = _analysis_rows_with_transform(filtered_rows, feature_column, feature_transform)
         transformed_plot_rows, _, _ = _analysis_rows_with_transform(plot_rows, feature_column, feature_transform)
@@ -5913,6 +6772,7 @@ def _step5_page(
         "feature_column": feature_column,
         "temporal_frequency": temporal_frequency,
         "feature_transform": feature_transform,
+        "wear_state": wear_state,
     })
     data_label = "Raw data" if is_raw else "Generated feature table"
     body = f"""
@@ -5928,6 +6788,8 @@ def _step5_page(
           <select name="temporal_frequency" {'disabled' if is_raw or not frequency_values else ''}>{_select_options_from_pairs(frequency_pairs, temporal_frequency)}</select>
           <label>Subject</label>
           <select name="username">{_select_options(subjects, subject)}</select>
+          <label>Wear-state filter</label>
+          <select name="wear_state">{_select_options_from_pairs(WEAR_STATE_FILTER_CHOICES, wear_state)}</select>
           <label>Feature / raw value field</label>
           <select name="feature_column">{_select_options_from_pairs(column_pairs, feature_column)}</select>
           <label>Transformation</label>
@@ -5951,6 +6813,7 @@ def _step5_page(
             <div class="viz-chip"><strong>Plot</strong>{html.escape(dict(plot_pairs).get(plot_type, plot_type))}</div>
             <div class="viz-chip"><strong>Data</strong>{html.escape(data_label)}</div>
             <div class="viz-chip"><strong>Subject</strong>{html.escape(subject)}</div>
+            <div class="viz-chip"><strong>Wear</strong>{html.escape(dict(WEAR_STATE_FILTER_CHOICES).get(wear_state, wear_state))}</div>
             <div class="viz-chip"><strong>Frequency</strong>{html.escape('Raw' if is_raw else (temporal_frequency if temporal_frequency != 'All' else _infer_temporal_frequency(filtered_rows or base_rows)))}</div>
             <div class="viz-chip"><strong>Transformation</strong>{html.escape(transform_info.get('label', 'No transformation'))}</div>
           </div>
@@ -6252,9 +7115,10 @@ def _build_report_html(
     created_text = html.escape(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
     feature_label = FEATURE_LABELS.get(feature_key, feature_key if feature_key != "All" else "Generated features")
 
-    indexed_subjects = len({getattr(row, "username", "") for row in APP_STATE.indexed_rows if getattr(row, "username", "")})
-    indexed_files = len({getattr(row, "source_file", "") for row in APP_STATE.indexed_rows if getattr(row, "source_file", "")})
-    indexed_sensors = len({getattr(row, "sensorname", "") for row in APP_STATE.indexed_rows if getattr(row, "sensorname", "")})
+    active_index = _active_indexed_rows()
+    indexed_subjects = len({getattr(row, "username", "") for row in active_index if getattr(row, "username", "")})
+    indexed_files = len({getattr(row, "source_file", "") for row in active_index if getattr(row, "source_file", "")})
+    indexed_sensors = len({getattr(row, "sensorname", "") for row in active_index if getattr(row, "sensorname", "")})
     flagged_files = sum(1 for row in APP_STATE.qc_rows if getattr(row, "qc_status", "") == "flagged")
     qc_ready_files = max(indexed_files - flagged_files, 0)
 
@@ -6459,9 +7323,10 @@ def _choose_file_native(prompt: str) -> str | None:
 
 
 def _indexed_summary_text() -> str:
-    if not APP_STATE.indexed_rows:
+    active_rows = _active_indexed_rows()
+    if not active_rows:
         return "No dataset indexed yet."
-    counts = summarize_indexed_files(APP_STATE.indexed_rows)
+    counts = summarize_indexed_files(active_rows)
     return (
         f"Indexed {counts['json_files']} JSON files across {counts['subjects']} subjects, "
         f"{counts['devices']} devices, and {counts['sensors']} sensor streams."
@@ -7825,6 +8690,68 @@ def health() -> dict[str, str]:
     return {"status": "ok", "mode": "local-web"}
 
 
+def _shutdown_server_after_delay(delay_sec: float = 0.8) -> None:
+    def _worker() -> None:
+        time.sleep(delay_sec)
+        global SERVER_INSTANCE
+        if SERVER_INSTANCE is not None:
+            SERVER_INSTANCE.should_exit = True
+            SERVER_INSTANCE.force_exit = True
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+@app.get("/action/shutdown_server", response_class=HTMLResponse)
+def shutdown_server() -> HTMLResponse:
+    if SERVER_INSTANCE is None:
+        APP_STATE.status = "No active local server instance was found to stop."
+    else:
+        APP_STATE.status = "Local server shutdown requested. Closing JTrack Insight."
+    _shutdown_server_after_delay()
+    return HTMLResponse(
+        """
+        <html>
+          <head>
+            <meta charset="utf-8" />
+            <title>JTrack Insight - Shutting Down</title>
+            <style>
+              body {
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                background: #f4f7fa;
+                color: #153650;
+                margin: 0;
+                padding: 32px;
+              }
+              .card {
+                max-width: 720px;
+                margin: 40px auto;
+                background: white;
+                border: 1px solid #dbe6ef;
+                border-radius: 16px;
+                padding: 28px 30px;
+                box-shadow: 0 12px 32px rgba(21, 54, 80, 0.08);
+              }
+              h1 { margin-top: 0; }
+              p { line-height: 1.6; }
+            </style>
+          </head>
+          <body>
+            <div class="card">
+              <h1>JTrack Insight is shutting down</h1>
+              <p>The local server has received the stop request and will close in a moment.</p>
+              <p>You can now close this browser tab or window.</p>
+            </div>
+            <script>
+              setTimeout(function () {
+                try { window.close(); } catch (err) {}
+              }, 1200);
+            </script>
+          </body>
+        </html>
+        """
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 def root(
     step: str = "home",
@@ -7840,6 +8767,7 @@ def root(
     feature_column: str = "All",
     feature_transform: str = "none",
     plot_type: str = "mean_ci",
+    wear_state: str = "All",
     render_plot: str = "0",
     analysis_type: str = "descriptives",
     cohort: list[str] = Query(default=["All"]),
@@ -7871,6 +8799,7 @@ def root(
             subject=username or "All",
             feature_column=feature_column,
             plot_type=plot_type,
+            wear_state=wear_state,
             cohort=cohort,
             sensor_name=sensor_name or "All",
             temporal_frequency=temporal_frequency,
@@ -7900,34 +8829,99 @@ def root(
 
 
 @app.get("/action/load_dataset")
-def load_dataset(dataset_root: str) -> RedirectResponse:
-    root_path = Path(dataset_root).expanduser().resolve()
-    indexed = scan_dataset_metadata(root_path)
-    qc_rows = scan_file_qc(indexed)
-    APP_STATE.data_root = str(root_path)
-    APP_STATE.indexed_rows = indexed
-    APP_STATE.qc_rows = qc_rows
-    APP_STATE.filtered_rows = indexed
-    APP_STATE.loaded_rows = []
-    APP_STATE.loaded_filtered_rows = []
-    APP_STATE.selected_sensor_name = None
-    APP_STATE.selected_wearable_sensor = None
-    APP_STATE.app_usage_daily = []
-    APP_STATE.app_usage_category_daily = []
-    APP_STATE.app_usage_category_daily_wide = []
-    APP_STATE.app_usage_review = None
-    APP_STATE.location_daily = []
-    APP_STATE.location_trajectory = []
-    APP_STATE.location_review = None
-    APP_STATE.pedometer_daily = []
-    APP_STATE.pedometer_review = None
-    APP_STATE.generated_feature_key = None
-    APP_STATE.feature_qc_rows = []
-    APP_STATE.feature_qc_audit_rows = []
-    APP_STATE.feature_qc_description = None
-    APP_STATE.app_category_map = load_app_category_mapping()
-    APP_STATE.app_category_source = str(DEFAULT_APP_CATEGORY_PATH) if APP_STATE.app_category_map else None
-    APP_STATE.status = f"Indexing completed at {iso_now()}. Loaded metadata for {summarize_indexed_files(indexed)['subjects']} subjects."
+def load_dataset(dataset_root: str = "") -> RedirectResponse:
+    requested_path = (dataset_root or "").strip()
+    if not requested_path:
+        APP_STATE.status = "Choose a dataset folder before loading."
+        return RedirectResponse(url="/?step=step1", status_code=303)
+
+    root_path = Path(requested_path).expanduser()
+    if not root_path.exists() or not root_path.is_dir():
+        APP_STATE.status = f"Dataset folder was not found: {root_path}"
+        return RedirectResponse(url="/?step=step1", status_code=303)
+
+    root_path = root_path.resolve()
+
+    def _index_dataset(update_progress) -> None:
+        indexed = scan_dataset_metadata(root_path, progress_callback=update_progress)
+        if not indexed:
+            raise ValueError("No JSON files were found. Select the study root that contains participant/device/sensor folders.")
+        with APP_STATE_LOCK:
+            APP_STATE.data_root = str(root_path)
+            APP_STATE.indexed_rows = indexed
+            APP_STATE.qc_rows = []
+            APP_STATE.qc_excluded_files = set()
+            _reset_downstream_state()
+            APP_STATE.app_category_map = load_app_category_mapping()
+            APP_STATE.app_category_source = str(DEFAULT_APP_CATEGORY_PATH) if APP_STATE.app_category_map else None
+            summary = summarize_indexed_files(indexed)
+            APP_STATE.status = (
+                f"Metadata indexing completed at {iso_now()}. Found {summary['json_files']} JSON files "
+                f"for {summary['subjects']} subject(s). Run File QC in Step 2 to validate files and detect duplicate content."
+            )
+
+    _start_background_operation("Dataset indexing", _index_dataset)
+    return RedirectResponse(url="/?step=step2", status_code=303)
+
+
+@app.get("/action/run_file_qc")
+def run_file_qc() -> RedirectResponse:
+    if not APP_STATE.indexed_rows:
+        APP_STATE.status = "No dataset is indexed yet. Load a dataset in Step 1 first."
+        return RedirectResponse(url="/?step=step1", status_code=303)
+
+    indexed_rows = list(APP_STATE.indexed_rows)
+
+    def _run_qc(update_progress) -> None:
+        qc_rows = scan_file_qc(indexed_rows, progress_callback=update_progress)
+        summary = summarize_qc_results(qc_rows)
+        with APP_STATE_LOCK:
+            APP_STATE.qc_rows = qc_rows
+            APP_STATE.status = (
+                f"File QC completed at {iso_now()}. Checked {summary.total_files} file(s): "
+                f"{summary.invalid_json_files} invalid JSON file(s) and {summary.duplicate_files} duplicate file(s) found."
+            )
+
+    _start_background_operation("File QC", _run_qc)
+    return RedirectResponse(url="/?step=step2", status_code=303)
+
+
+@app.get("/action/exclude_qc_duplicates")
+def exclude_qc_duplicates() -> RedirectResponse:
+    if not APP_STATE.qc_rows:
+        APP_STATE.status = "No QC scan is available yet. Load a dataset first."
+        return RedirectResponse(url="/?step=step2", status_code=303)
+    to_exclude = _duplicate_exclusion_file_keys(APP_STATE.qc_rows)
+    APP_STATE.qc_excluded_files.update(to_exclude)
+    _reset_downstream_state()
+    APP_STATE.status = (
+        f"Excluded {len(to_exclude)} duplicate copy/copies at {iso_now()}. "
+        f"One representative file per duplicate-content group was kept."
+    )
+    return RedirectResponse(url="/?step=step2", status_code=303)
+
+
+@app.get("/action/exclude_qc_invalid_json")
+def exclude_qc_invalid_json() -> RedirectResponse:
+    if not APP_STATE.qc_rows:
+        APP_STATE.status = "No QC scan is available yet. Load a dataset first."
+        return RedirectResponse(url="/?step=step2", status_code=303)
+    to_exclude = {
+        _qc_file_key(getattr(item, "source_file", ""))
+        for item in APP_STATE.qc_rows
+        if not getattr(item, "json_valid", True)
+    }
+    APP_STATE.qc_excluded_files.update(to_exclude)
+    _reset_downstream_state()
+    APP_STATE.status = f"Excluded {len(to_exclude)} invalid JSON file(s) at {iso_now()}."
+    return RedirectResponse(url="/?step=step2", status_code=303)
+
+
+@app.get("/action/clear_qc_exclusions")
+def clear_qc_exclusions() -> RedirectResponse:
+    APP_STATE.qc_excluded_files = set()
+    _reset_downstream_state()
+    APP_STATE.status = "Cleared file-level QC exclusions. All indexed files are back in scope."
     return RedirectResponse(url="/?step=step2", status_code=303)
 
 
@@ -8107,6 +9101,7 @@ def load_app_categories(
     APP_STATE.location_daily = []
     APP_STATE.location_trajectory = []
     APP_STATE.location_review = None
+    APP_STATE.lockunlock_daily = []
     APP_STATE.pedometer_daily = []
     APP_STATE.pedometer_review = None
     APP_STATE.generic_sensor_daily = []
@@ -8143,6 +9138,7 @@ def use_default_app_categories(
     APP_STATE.location_daily = []
     APP_STATE.location_trajectory = []
     APP_STATE.location_review = None
+    APP_STATE.lockunlock_daily = []
     APP_STATE.pedometer_daily = []
     APP_STATE.pedometer_review = None
     if APP_STATE.app_category_map:
@@ -8158,7 +9154,7 @@ def use_default_app_categories(
 @app.get("/action/apply_scope")
 def apply_scope(username: str = "All", device_id: str = "All", sensor_name: str = "All", wearable_sensor: str = "All") -> RedirectResponse:
     APP_STATE.filtered_rows = filter_indexed_files(
-        APP_STATE.indexed_rows,
+        _active_indexed_rows(),
         username=username,
         device_id=device_id,
         sensor_name=sensor_name,
@@ -8175,6 +9171,7 @@ def apply_scope(username: str = "All", device_id: str = "All", sensor_name: str 
     APP_STATE.location_daily = []
     APP_STATE.location_trajectory = []
     APP_STATE.location_review = None
+    APP_STATE.lockunlock_daily = []
     APP_STATE.pedometer_daily = []
     APP_STATE.pedometer_review = None
     APP_STATE.generic_sensor_daily = []
@@ -8197,19 +9194,35 @@ def apply_scope(username: str = "All", device_id: str = "All", sensor_name: str 
 
 @app.get("/action/load_scoped_data")
 def load_scoped_data() -> RedirectResponse:
-    APP_STATE.loaded_rows = load_indexed_json_rows(APP_STATE.filtered_rows)
-    APP_STATE.loaded_filtered_rows = APP_STATE.loaded_rows
-    APP_STATE.app_usage_daily = []
-    APP_STATE.app_usage_category_daily = []
-    APP_STATE.app_usage_category_daily_wide = []
-    APP_STATE.app_usage_review = None
-    APP_STATE.location_daily = []
-    APP_STATE.location_trajectory = []
-    APP_STATE.location_review = None
-    APP_STATE.pedometer_daily = []
-    APP_STATE.pedometer_review = None
-    summary = summarize_loaded_rows(APP_STATE.loaded_rows)
-    APP_STATE.status = f"Scoped data loaded at {iso_now()}. {summary.records_loaded} records are ready for the next Python step."
+    selected_sensor = APP_STATE.selected_sensor_name or APP_STATE.selected_wearable_sensor or "All"
+    indexed_rows = list(APP_STATE.filtered_rows)
+    if not indexed_rows:
+        APP_STATE.status = "No JSON files are in the selected scope. Adjust the metadata filters before loading raw data."
+        return RedirectResponse(url="/?step=step3b", status_code=303)
+
+    def _load_scope(update_progress) -> None:
+        loaded_rows = _load_rows_for_scope(
+            indexed_rows,
+            selected_sensor=selected_sensor,
+            progress_callback=update_progress,
+        )
+        summary = summarize_loaded_rows(loaded_rows)
+        with APP_STATE_LOCK:
+            APP_STATE.loaded_rows = loaded_rows
+            APP_STATE.loaded_filtered_rows = loaded_rows
+            APP_STATE.app_usage_daily = []
+            APP_STATE.app_usage_category_daily = []
+            APP_STATE.app_usage_category_daily_wide = []
+            APP_STATE.app_usage_review = None
+            APP_STATE.location_daily = []
+            APP_STATE.location_trajectory = []
+            APP_STATE.location_review = None
+            APP_STATE.lockunlock_daily = []
+            APP_STATE.pedometer_daily = []
+            APP_STATE.pedometer_review = None
+            APP_STATE.status = f"Scoped data loaded at {iso_now()}. {summary.records_loaded} records are ready for the next Python step."
+
+    _start_background_operation("Scoped data loading", _load_scope)
     return RedirectResponse(url="/?step=step3c", status_code=303)
 
 
@@ -8228,6 +9241,7 @@ def apply_loaded_filters(min_day: int = 0, max_day: int = 0) -> RedirectResponse
     APP_STATE.location_daily = []
     APP_STATE.location_trajectory = []
     APP_STATE.location_review = None
+    APP_STATE.lockunlock_daily = []
     APP_STATE.pedometer_daily = []
     APP_STATE.pedometer_review = None
     APP_STATE.generic_sensor_daily = []
@@ -8256,7 +9270,7 @@ def compute_feature(
         temporal_frequency = "daily"
 
     APP_STATE.filtered_rows = _filter_index_for_feature(username=username, sensor_name=sensor_name)
-    APP_STATE.loaded_rows = load_indexed_json_rows(APP_STATE.filtered_rows)
+    APP_STATE.loaded_rows = _load_rows_for_scope(APP_STATE.filtered_rows, selected_sensor=sensor_name)
     APP_STATE.loaded_filtered_rows = APP_STATE.loaded_rows
     APP_STATE.selected_sensor_name = None if sensor_name == "All" else sensor_name
     APP_STATE.selected_wearable_sensor = None
@@ -8267,6 +9281,7 @@ def compute_feature(
     APP_STATE.location_daily = []
     APP_STATE.location_trajectory = []
     APP_STATE.location_review = None
+    APP_STATE.lockunlock_daily = []
     APP_STATE.pedometer_daily = []
     APP_STATE.pedometer_review = None
     APP_STATE.generic_sensor_daily = []
@@ -8329,6 +9344,12 @@ def compute_feature(
                 "median_accuracy_m": review.median_accuracy_m,
                 "max_daily_distance_km": review.max_daily_distance_km,
             }
+    elif feature_key == "lockunlock_daily":
+        APP_STATE.lockunlock_daily = _lockunlock_daily_features(
+            rows,
+            temporal_frequency=temporal_frequency,
+            selected_features=selected_features,
+        )
     elif feature_key == "pedometer_daily":
         review, daily = review_pedometer(rows)
         APP_STATE.pedometer_daily = daily
@@ -8380,6 +9401,9 @@ def compute_feature(
     elif feature_key == "location_daily":
         APP_STATE.location_daily = _filter_feature_columns(APP_STATE.location_daily, sensor_name, feature_name_for_filter)
         APP_STATE.location_daily = _standardize_generated_feature_names(_aggregate_feature_rows_by_temporal(APP_STATE.location_daily, temporal_frequency))
+    elif feature_key == "lockunlock_daily":
+        APP_STATE.lockunlock_daily = _filter_feature_columns(APP_STATE.lockunlock_daily, sensor_name, feature_name_for_filter)
+        APP_STATE.lockunlock_daily = _standardize_generated_feature_names(APP_STATE.lockunlock_daily)
     elif feature_key == "pedometer_daily":
         APP_STATE.pedometer_daily = _filter_feature_columns(APP_STATE.pedometer_daily, sensor_name, feature_name_for_filter)
         APP_STATE.pedometer_daily = _standardize_generated_feature_names(_aggregate_feature_rows_by_temporal(APP_STATE.pedometer_daily, temporal_frequency))
@@ -8761,6 +9785,7 @@ def export_generated_features_csv(
     feature_key: str = "All",
     subject: str = "All",
     feature_column: str = "All",
+    wear_state: str = "All",
     cohort: str = "All",
     sensor_name: str = "All",
     temporal_frequency: str = "All",
@@ -8768,11 +9793,12 @@ def export_generated_features_csv(
 ) -> Response:
     if feature_key == "raw_sensor_data":
         rows = _raw_rows_filtered(subject=subject, sensor_name=sensor_name, cohort=cohort)
+        rows = _filter_rows_by_wear_state(rows, wear_state)
         filename = "jtrack_insight_raw_sensor_data.csv"
     else:
         if feature_key == "All" and APP_STATE.generated_feature_key:
             feature_key = APP_STATE.generated_feature_key
-        rows = _filtered_feature_rows(feature_key, subject=subject, feature_column=feature_column, cohort=cohort)
+        rows = _filtered_feature_rows(feature_key, subject=subject, feature_column=feature_column, cohort=cohort, wear_state=wear_state)
         rows = _filter_rows_by_temporal_frequency(rows, temporal_frequency)
         rows, _transformed_column, _transform_info = _transform_feature_rows(rows, feature_column, feature_transform)
         filename = "jtrack_insight_generated_features.csv"
@@ -8828,5 +9854,16 @@ def export_report_html(
     )
 
 
+def run_server(host: str = "127.0.0.1", port: int = 8000) -> None:
+    global SERVER_INSTANCE
+    config = uvicorn.Config(app, host=host, port=port, reload=False)
+    server = uvicorn.Server(config)
+    SERVER_INSTANCE = server
+    try:
+        server.run()
+    finally:
+        SERVER_INSTANCE = None
+
+
 def main() -> None:
-    uvicorn.run("trackautism_app.server.web:app", host="127.0.0.1", port=8000, reload=False)
+    run_server()

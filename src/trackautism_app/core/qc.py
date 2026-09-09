@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from hashlib import md5
 import json
 from pathlib import Path
+from typing import Callable
 
 from trackautism_app.core.indexing import IndexedFile
 
@@ -64,13 +65,17 @@ def _validate_json_text(file_path: Path) -> tuple[bool, str | None]:
     return True, None
 
 
-def scan_file_qc(indexed_files: list[IndexedFile]) -> list[QCScanItem]:
+def scan_file_qc(
+    indexed_files: list[IndexedFile],
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> list[QCScanItem]:
     """Run content-hash duplicate detection and JSON validity checks."""
     results: list[QCScanItem] = []
     hash_counts: dict[str, int] = {}
     interim_rows: list[tuple[IndexedFile, str | None, int | None, bool, str | None]] = []
 
-    for row in indexed_files:
+    total = len(indexed_files)
+    for position, row in enumerate(indexed_files, start=1):
         file_path = row.source_file
         file_hash: str | None = None
         file_size: int | None = None
@@ -93,7 +98,11 @@ def scan_file_qc(indexed_files: list[IndexedFile]) -> list[QCScanItem]:
             json_valid, json_error = _validate_json_text(file_path)
 
         interim_rows.append((row, file_hash, file_size, json_valid, json_error))
+        if progress_callback and (position == total or position == 1 or position % 10 == 0):
+            progress_callback(position, total, f"Hashing and validating JSON files ({position:,} of {total:,})...")
 
+    if progress_callback:
+        progress_callback(total, total, "Summarizing duplicate-content groups...")
     for row, file_hash, file_size, json_valid, json_error in interim_rows:
         duplicate = bool(file_hash and hash_counts.get(file_hash, 0) > 1)
         duplicate_group = file_hash[:12] if duplicate and file_hash else None

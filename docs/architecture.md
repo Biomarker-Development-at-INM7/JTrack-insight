@@ -3,9 +3,8 @@
 ## Purpose
 
 This Python app is a parallel rebuild of the R workflow, not a replacement yet.
-The current R app remains the scientific reference:
-
-- the reference workflow
+The current R workflow remains the scientific reference for method comparison
+and validation.
 
 ## High-Level Layout
 

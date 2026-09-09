@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from typing import Callable
 
 from trackautism_app.core.indexing import IndexedFile
 
@@ -121,11 +122,15 @@ def attach_loaded_time_fields(rows: list[dict]) -> list[dict]:
     return enriched_rows
 
 
-def load_indexed_json_rows(indexed_files: list[IndexedFile]) -> list[dict]:
+def load_indexed_json_rows(
+    indexed_files: list[IndexedFile],
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> list[dict]:
     """Load scoped JSON payloads into row dictionaries with metadata attached."""
     loaded_rows: list[dict] = []
 
-    for row in indexed_files:
+    total = len(indexed_files)
+    for position, row in enumerate(indexed_files, start=1):
         try:
             payload = json.loads(row.source_file.read_text(encoding="utf-8"))
         except UnicodeDecodeError:
@@ -144,6 +149,11 @@ def load_indexed_json_rows(indexed_files: list[IndexedFile]) -> list[dict]:
             enriched.setdefault("wearable_sensor", row.wearable_sensor)
             loaded_rows.append(enriched)
 
+        if progress_callback and (position == total or position == 1 or position % 5 == 0):
+            progress_callback(position, total, f"Reading selected JSON files ({position:,} of {total:,})...")
+
+    if progress_callback:
+        progress_callback(total, total, "Deriving analysis time and study-day fields...")
     return attach_loaded_time_fields(loaded_rows)
 
 

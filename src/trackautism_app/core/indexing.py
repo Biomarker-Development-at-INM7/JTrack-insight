@@ -7,6 +7,7 @@ entire workflow and is comparatively easy to validate.
 from dataclasses import dataclass
 from pathlib import Path
 import re
+from typing import Callable
 
 
 SUBJECT_PATTERN = re.compile(r"^TrackAutism_[0-9]+_[0-9]+$")
@@ -148,14 +149,25 @@ def extract_metadata_from_path(file_path: Path, root_dir: Path) -> IndexedFile:
     )
 
 
-def scan_dataset_metadata(root_dir: Path) -> list[IndexedFile]:
+def scan_dataset_metadata(
+    root_dir: Path,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> list[IndexedFile]:
     """Scan a dataset root and infer study/user/device/sensor metadata."""
     root_dir = Path(root_dir).expanduser().resolve()
     if not root_dir.exists() or not root_dir.is_dir():
         raise FileNotFoundError(f"Dataset root not found: {root_dir}")
 
+    if progress_callback:
+        progress_callback(0, 0, "Finding JSON files in the selected folder...")
     files = sorted(path for path in root_dir.rglob("*.json") if _should_keep_json(root_dir, path))
-    return [extract_metadata_from_path(path, root_dir) for path in files]
+    total = len(files)
+    indexed: list[IndexedFile] = []
+    for position, path in enumerate(files, start=1):
+        indexed.append(extract_metadata_from_path(path, root_dir))
+        if progress_callback and (position == total or position == 1 or position % 25 == 0):
+            progress_callback(position, total, f"Indexing file metadata ({position:,} of {total:,})...")
+    return indexed
 
 
 def summarize_indexed_files(indexed_files: list[IndexedFile]) -> dict[str, int]:

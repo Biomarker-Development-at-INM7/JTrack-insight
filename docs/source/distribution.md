@@ -1,0 +1,4 @@
+# Distribution
+
+```{include} ../distribution.md
+```
