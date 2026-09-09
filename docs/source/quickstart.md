@@ -19,7 +19,7 @@ computer; routine analysis does not require an internet connection.
 If you run the development version, use:
 
 ```bash
-cd "JTrack-insight"
+cd JTrack-insight
 source .venv/bin/activate
 python3 main.py --mode browser
 ```

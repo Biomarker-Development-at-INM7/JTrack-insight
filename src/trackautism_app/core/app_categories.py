@@ -7,8 +7,9 @@ from pathlib import Path
 from io import StringIO
 
 
-DEFAULT_APP_CATEGORY_PATH = Path("resources/app_category_mapping.csv")
-DEFAULT_APP_CATEGORY_CODEBOOK_PATH = Path("resources/app_category_codebook.csv")
+RESOURCE_DIR = Path(__file__).resolve().parents[3] / "resources"
+DEFAULT_APP_CATEGORY_PATH = RESOURCE_DIR / "app_category_mapping.csv"
+DEFAULT_APP_CATEGORY_CODEBOOK_PATH = RESOURCE_DIR / "app_category_codebook.csv"
 
 APP_COLUMN_CANDIDATES = (
     "App",

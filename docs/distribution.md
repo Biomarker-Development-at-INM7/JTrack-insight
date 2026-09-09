@@ -19,7 +19,7 @@ data processing on the user's own machine.
 ### Browser-launch mode
 
 ```bash
-cd "JTrack-insight"
+cd JTrack-insight
 source .venv/bin/activate
 python3 main.py --mode browser
 ```
@@ -27,7 +27,7 @@ python3 main.py --mode browser
 ### Web mode
 
 ```bash
-cd "JTrack-insight"
+cd JTrack-insight
 source .venv/bin/activate
 python3 main.py --mode web
 ```
@@ -35,7 +35,7 @@ python3 main.py --mode web
 ## Install Packaging Dependencies
 
 ```bash
-cd "JTrack-insight"
+cd JTrack-insight
 source .venv/bin/activate
 pip install -e ".[desktop,server,science,storage,dev]"
 ```
@@ -43,7 +43,7 @@ pip install -e ".[desktop,server,science,storage,dev]"
 ## Build a macOS App
 
 ```bash
-cd "JTrack-insight"
+cd JTrack-insight
 source .venv/bin/activate
 pyinstaller packaging/jtrack-insight.spec --noconfirm
 ```
@@ -62,7 +62,7 @@ For internal testing, you can distribute:
 Example:
 
 ```bash
-cd "dist"
+cd dist
 zip -r "JTrack Insight-macOS.zip" "JTrack Insight.app"
 ```
 
